@@ -31,12 +31,12 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <signal.h>
-
 #include <libvmi/libvmi.h>
 #include <libvmi/events.h>
 
 #define EXTRACT_SIZE 10
 #define RNG_VALUE "ffffffffffffffffffffffffffffffffffff" // "f" is 0x66 in ascii
+//#define RNG_VALUE "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" // "i" is 0x69 in ascii
 #define INT3_INST (0xCC)
 
 vmi_event_t rng_event;
@@ -71,6 +71,47 @@ size_t nbytes = 0;
 ////////////////////
 // User Callbacks //
 ////////////////////
+
+event_response_t before_extract_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called before_extract_buf!\n");
+
+	// look at args
+	printf("Reading RDI register (*r):      0x%llx\n", event->regs.x86->rdi);
+	printf("Reading RSI register (*tmp):    0x%llx\n", event->regs.x86->rsi);
+
+	// store *tmp for later overwriting
+	rng_buf = event->regs.x86->rsi;
+
+	return VMI_SUCCESS;
+}
+
+event_response_t after_extract_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called after_extract_buf!\n");
+
+	// read in all the bytes at buf
+	uint8_t buffer[EXTRACT_SIZE];
+
+	vmi_read_va(vmi, rng_buf, 0, buffer, EXTRACT_SIZE);
+	printf("old buf: ");
+	for (int i = 0; i < EXTRACT_SIZE; i++) {
+		printf("%02x ",buffer[i]);
+	}
+	printf("\n");
+
+	// modify rng buffer!
+	vmi_write_va(vmi, rng_buf , 0, RNG_VALUE, EXTRACT_SIZE);
+
+	// read in all the bytes at buf again (sanity check)
+	vmi_read_va(vmi, rng_buf, 0, buffer, EXTRACT_SIZE);
+	printf("new buf: ");
+	for (int i = 0; i < EXTRACT_SIZE; i++) {
+		printf("%02x ",buffer[i]);
+	}
+	printf("\n");
+
+	return VMI_SUCCESS;
+}
+
 
 event_response_t urandom_read_start(vmi_instance_t vmi, vmi_event_t *event) {
 	printf("Called urandom_read_start!\n");
@@ -186,7 +227,7 @@ event_response_t overwrite_buf(vmi_instance_t vmi, vmi_event_t *event) {
 	printf("\n");
 
 	// modify rng buffer! (should be at RSP+0x16, from static code analysis)
-	vmi_write_va(vmi, val_addr, 0, RNG_VALUE, EXTRACT_SIZE);
+	vmi_write_va(vmi, val_addr, 0, RNG_VALUE , EXTRACT_SIZE);
 
 	// what's at RSP+0x16 now?
 	vmi_read_va(vmi, val_addr, 0, buf, EXTRACT_SIZE);
@@ -316,10 +357,10 @@ int main (int argc, char **argv)
 	int ret_val = 0; // return code for after goto
 	struct sigaction signal_action;
 
-	char*			*sym;
-  uint16_t	*off;
-  addr_t		*add;
-  uint8_t		*byt;
+	char*		*sym;
+	uint16_t	*off;
+	addr_t		*add;
+	uint8_t		*byt;
 
 	// this is the VM or file that we are looking at
 	if (argc != 2) {
@@ -335,8 +376,10 @@ int main (int argc, char **argv)
 	//add_breakpoint("extract_entropy", 135, 0xe8, find_buf);
 	//add_breakpoint("get_random_bytes", 5, 0x41, get_nbytes_buf);
 	//add_breakpoint("extract_entropy", 249, 0x41, check_buf);
-	add_breakpoint("urandom_read", 5, 0xf6, urandom_read_start);
-	add_breakpoint("urandom_read", 83, 0x41, urandom_read_end);
+	//add_breakpoint("urandom_read", 5, 0xf6, urandom_read_start);
+	//add_breakpoint("urandom_read", 83, 0x41, urandom_read_end);
+	add_breakpoint("extract_entropy_user", 155, 0xe8, before_extract_buf);
+	add_breakpoint("extract_entropy_user", 160, 0x83, after_extract_buf);
 
 	////////////////////
 	// Initialization // 

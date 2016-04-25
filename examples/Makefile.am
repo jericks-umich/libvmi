@@ -9,7 +9,7 @@ LDADD = -lvmi -lm $(LIBS) $(GLIB_LIBS)
 
 bin_PROGRAMS =  module-list \
                 process-list \
-                rng-hook \
+                rng-hook_kernel_fixed \
                 shm-snapshot-process-list \
                 map-symbol \
                 map-addr \
@@ -24,7 +24,7 @@ bin_PROGRAMS =  module-list \
 
 module_list_SOURCES = module-list.c
 process_list_SOURCES = process-list.c
-rng_hook_SOURCES = rng-hook.c
+rng_hook_kernel_fixed_SOURCES = rng-hook_kernel_fixed.c
 shm_snapshot_process_list_SOURCES = shm-snapshot-process-list.c
 map_symbol_SOURCES = map-symbol.c
 map_addr_SOURCES = map-addr.c
