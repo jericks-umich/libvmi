@@ -36,17 +36,40 @@
 #include <libvmi/events.h>
 
 #define FUNC_NAME "extract_entropy"
+#define EXTRACT_SIZE 10
+#define RNG_VALUE "ffffffffffffffffffffffffffffffffffff" // "f" is 0x66 in ascii
 
 vmi_event_t rng_event;
+vmi_event_t rng_ss_event;
 
 static int interrupted = 0; // set to non-zero when an interrupt happens so we can exit cleanly
 static void close_handler(int signal) {
 	interrupted = signal; // set interrupted to non-zero interrupt signal
 }
+static uint8_t cmp_replace_byte = 0x41; // not a pointer, static value
+static uint8_t int3_inst = 0xcc; // not a pointer, static value
+static unsigned int offset = 140; // offset into func
 
-//////////////
-// Callback // 
-//////////////
+addr_t func = 0;
+addr_t cmp = 0;
+
+///////////////
+// Callbacks // 
+///////////////
+
+event_response_t rng_single_step_callback(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Got a single-step callback!\n");
+
+	// gameplan step 5
+	printf("Re-adding breakpoint before instruction.\n");
+	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &int3_inst)) {
+		printf("Couldn't write to memory... exiting.\n");
+		return VMI_FAILURE;
+	}
+
+	vmi_clear_event(vmi, event, NULL);	
+	return VMI_SUCCESS;
+}
 
 event_response_t rng_event_callback(vmi_instance_t vmi, vmi_event_t* event) {
 	printf("Got a callback!\n");
@@ -82,14 +105,41 @@ event_response_t rng_event_callback(vmi_instance_t vmi, vmi_event_t* event) {
 	// https://blogs.oracle.com/eschrock/entry/debugging_://blogs.oracle.com/eschrock/entry/debugging_on_amd64_part_twoon_amd64_part_tworintf("Reading R9 register: 0x%llx\n\n", register_value);
 	
 	printf("Reading RDI register (*r):   0x%llx\n", event->regs.x86->rdi);
-	printf("Reading RSI register (tmp):  0x%llx\n", event->regs.x86->rsi);
-	printf("Reading RSP+0x16:            0x%llx  (should be the same as RSI)\n", event->regs.x86->rsp+0x16);
+	printf("Reading RSP+0x16:            0x%llx  (should be the same as RSI used to be)\n", event->regs.x86->rsp+0x16);
+
+	// modify rng buffer! (should be at RSP+0x16, from static code analysis)
+	val_addr = event->regs.x86->rsp + 0x16;
+	vmi_write_va(vmi, val_addr, 0, RNG_VALUE, EXTRACT_SIZE);
 
 	// see "Main gameplan" comment section below for context
 	//	3) at the end of the callback, fix the memory to its original instruction,
 	//	4) single-step one instruction forward, executing the one instruction, then getting another callback
 	//	5) replace the previous instruction with to 0xcc, "resetting" the breakpoint, then clearing the event and continuing
 
+	// gameplan step 3
+	printf("Removing breakpoint before instruction.\n");
+	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &cmp_replace_byte)) {
+		printf("Couldn't write to memory... exiting.\n");
+		return VMI_FAILURE;
+	}
+
+	// gameplan step 4
+	// create singlestep event and register it
+	printf("Creating singlestep event to replace breakpoint\n");
+	memset(&rng_ss_event, 0, sizeof(vmi_event_t));
+	rng_ss_event.type = VMI_EVENT_SINGLESTEP;
+	rng_ss_event.callback = rng_single_step_callback;
+	rng_ss_event.ss_event.enable = 1;
+	SET_VCPU_SINGLESTEP(rng_ss_event.ss_event, event->vcpu_id);
+	printf("Registering event...\n");
+	if (VMI_SUCCESS == vmi_register_event(vmi, &rng_ss_event)) {; // register the event!
+		printf("Event Registered!\n");
+	} else { // uh oh, event failed
+		printf("Problem registering singlestep event... exiting.\n");
+		return VMI_FAILURE;
+	}
+
+	// we don't appear to need to clear the event (clearing event for memory, register, and single-step events)
 	return VMI_SUCCESS;
 }
 
@@ -103,12 +153,7 @@ int main (int argc, char **argv)
 	vmi_instance_t vmi;
 	status_t status = VMI_SUCCESS;
 	int ret_val = 0; // return code for after goto
-	unsigned int offset = 135; // offset into func
-	addr_t func = 0;
-	addr_t cmp = 0;
-	uint8_t* cmp_inst  = NULL;
-	uint8_t cmp_replace_byte = 0xe8; // not a pointer, static value
-	uint8_t int3_inst = 0xcc; // not a pointer, static value
+	uint8_t* cmp_inst  = NULL; // temp buffer for value of instruction byte
 	struct sigaction signal_action;
 
 	// this is the VM or file that we are looking at
