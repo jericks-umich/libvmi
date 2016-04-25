@@ -64,9 +64,80 @@ breakpoint_t* breakpoints = NULL; // this will be allocated later in main
 unsigned int num_breakpoints = 0; // this will be incremented as we add breakpoints
 int break_idx; // set and used in callbacks as message passing interface. NOT THREAD SAFE!!!
 
+// temp storage for buf and nbytes
+addr_t rng_buf = 0;
+size_t nbytes = 0;
+
 ////////////////////
 // User Callbacks //
 ////////////////////
+
+event_response_t urandom_read_start(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called urandom_read_start!\n");
+
+	// args: (struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+	printf("Reading RDI register (*file):   0x%llx\n", event->regs.x86->rdi);
+	printf("Reading RSI register (*buf):    0x%llx\n", event->regs.x86->rsi);
+	printf("Reading RDX register (nbytes):  %u\n", event->regs.x86->rdx);
+	printf("Reading RCX register (*ppos):   0x%llx\n", event->regs.x86->rcx);
+
+	// save values for later use
+	rng_buf = event->regs.x86->rsi;
+	nbytes = event->regs.x86->rdx;
+
+	return VMI_SUCCESS;
+}
+
+event_response_t urandom_read_end(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called urandom_read_end!\n");
+
+	// read in all the bytes at buf
+	uint8_t buffer[nbytes];
+	vmi_read_va(vmi, rng_buf, 0, buffer, nbytes);
+	printf("buf: ");
+	for (int i = 0; i < nbytes; i++) {
+		printf("%02x ",buffer[i]);
+	}
+	printf("\n");
+	
+	// clear global vars
+	rng_buf = 0;
+	nbytes = 0;
+
+	return VMI_SUCCESS;
+}
+
+event_response_t get_nbytes_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called get_nbytes_buf!\n");
+
+	// get addresses for (void *buf, int nbytes) RDI, RSI
+	printf("Reading RDI register (*buf):      0x%llx\n", event->regs.x86->rdi);
+	printf("Reading RSI register (nbytes):    0x%llx\n", event->regs.x86->rsi);
+	rng_buf = event->regs.x86->rdi;
+	nbytes = event->regs.x86->rsi;
+
+	return VMI_SUCCESS;
+}
+
+event_response_t check_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called check_buf!\n");
+
+	// sanity check
+	if (rng_buf == 0 || nbytes == 0) {
+		printf("We don't have a buf or nbytes! AHHHHHH! 0x%llx   %u\n", rng_buf, nbytes);
+	}
+
+	// read in all the bytes at buf
+	uint8_t buffer[nbytes];
+	vmi_read_va(vmi, rng_buf, 0, buffer, nbytes);
+	printf("buf: ");
+	for (int i = 0; i < nbytes; i++) {
+		printf("%02x ",buffer[i]);
+	}
+	printf("\n");
+
+	return VMI_SUCCESS;
+}
 
 event_response_t find_buf(vmi_instance_t vmi, vmi_event_t *event) {
 	printf("Called find_buf!\n");
@@ -97,7 +168,7 @@ event_response_t overwrite_buf(vmi_instance_t vmi, vmi_event_t *event) {
 	//////////////////////////
 	
 	// Print amd64 function args --> see below link for reference
-	// https://blogs.oracle.com/eschrock/entry/debugging_://blogs.oracle.com/eschrock/entry/debugging_on_amd64_part_twoon_amd64_part_tworintf("Reading R9 register: 0x%llx\n\n", register_value);	
+	// https://blogs.oracle.com/eschrock/entry/debugging_://blogs.oracle.com/eschrock/entry/debugging_on_amd64_part_twoon_amd64_part_two
 	
 	printf("Reading RDI register (*r):      0x%llx\n", event->regs.x86->rdi);
 	printf("Reading RSI register (*tmp):    0x%llx\n", event->regs.x86->rsi);
@@ -133,13 +204,13 @@ event_response_t overwrite_buf(vmi_instance_t vmi, vmi_event_t *event) {
 //////////////////////
 
 event_response_t rng_single_step_callback(vmi_instance_t vmi, vmi_event_t *event) {
-	printf("Got a single-step callback!\n");
+	//printf("Got a single-step callback!\n");
 
 	// gameplan step 5
-	printf("Re-adding breakpoint before instruction.\n");
+	//printf("Re-adding breakpoint before instruction.\n");
 	uint8_t int3 = INT3_INST; // create temporary variable because we can't use an address to a static #defined int
 	if (VMI_SUCCESS != vmi_write_8_va(vmi, breakpoints[break_idx].addr, 0, &int3)) {
-		printf("Couldn't write to memory... exiting.\n");
+		//printf("Couldn't write to memory... exiting.\n");
 		return VMI_FAILURE;
 	}
 
@@ -154,7 +225,7 @@ event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event)
 
 	break_idx = -1;
 
-	printf("Got an interrupt callback!\n");
+	//printf("Got an interrupt callback!\n");
 
 	// clear reinject
 	//printf("Current reinject state (1 to deliver to guest, 0 to silence): %d\n", event->interrupt_event.reinject);
@@ -165,11 +236,11 @@ event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event)
 	}
 
 	// iterate over breakpoints until we find the one we're at
-	printf("Looking for the breakpoint for address 0x%llx\n", event->interrupt_event.gla);
+	//printf("Looking for the breakpoint for address 0x%llx\n", event->interrupt_event.gla);
 	for (int i = 0; i < num_breakpoints; i++) { 
 		if (event->interrupt_event.gla == breakpoints[i].addr) { // if we've found the correct breakpoint
 			break_idx = i;
-			printf("Found it: %d!\n", i);
+			//printf("Found it: %d!\n", i);
 			break;
 		}
 	}
@@ -190,7 +261,7 @@ event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event)
 	//	5) replace the previous instruction with to 0xcc, "resetting" the breakpoint, then clearing the event and continuing
 
 	// gameplan step 3
-	printf("Removing breakpoint before instruction.\n");
+	//printf("Removing breakpoint before instruction.\n");
 	if (VMI_SUCCESS != vmi_write_8_va(vmi, breakpoints[break_idx].addr, 0, &(breakpoints[break_idx].inst_byte))) {
 		printf("Couldn't write to memory... exiting.\n");
 		return VMI_FAILURE;
@@ -198,15 +269,15 @@ event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event)
 
 	// gameplan step 4
 	// create singlestep event and register it
-	printf("Creating singlestep event to replace breakpoint\n");
+	//printf("Creating singlestep event to replace breakpoint\n");
 	memset(&rng_ss_event, 0, sizeof(vmi_event_t));
 	rng_ss_event.type = VMI_EVENT_SINGLESTEP;
 	rng_ss_event.callback = rng_single_step_callback;
 	rng_ss_event.ss_event.enable = 1;
 	SET_VCPU_SINGLESTEP(rng_ss_event.ss_event, event->vcpu_id);
-	printf("Registering event...\n");
+	//printf("Registering event...\n");
 	if (VMI_SUCCESS == vmi_register_event(vmi, &rng_ss_event)) {; // register the event!
-		printf("Event Registered!\n");
+		//printf("Event Registered!\n");
 	} else { // uh oh, event failed
 		printf("Problem registering singlestep event... exiting.\n");
 		return VMI_FAILURE;
@@ -260,8 +331,12 @@ int main (int argc, char **argv)
 
 	// Set up breakpoints
 	breakpoints = (breakpoint_t*)calloc(MAX_BREAKPOINTS, sizeof(breakpoint_t)); // allocate space for each breakpoint, zero memory
-	add_breakpoint("extract_entropy", 140, 0x41, overwrite_buf);
-	add_breakpoint("extract_entropy", 135, 0xe8, find_buf);
+	//add_breakpoint("extract_entropy", 140, 0x41, overwrite_buf);
+	//add_breakpoint("extract_entropy", 135, 0xe8, find_buf);
+	//add_breakpoint("get_random_bytes", 5, 0x41, get_nbytes_buf);
+	//add_breakpoint("extract_entropy", 249, 0x41, check_buf);
+	add_breakpoint("urandom_read", 5, 0xf6, urandom_read_start);
+	add_breakpoint("urandom_read", 83, 0x41, urandom_read_end);
 
 	////////////////////
 	// Initialization // 
