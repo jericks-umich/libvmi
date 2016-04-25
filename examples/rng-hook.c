@@ -59,8 +59,9 @@ typedef struct Breakpoints {
 	event_response_t (*callback)(vmi_instance_t, vmi_event_t*);		// callback function to invoke after breakpoint is reached
 } breakpoint_t;
 
-unsigned int num_breakpoints; // this will be assigned later in main
-breakpoint_t* breakpoints; // this will be allocated later in main
+#define MAX_BREAKPOINTS 10
+breakpoint_t* breakpoints = NULL; // this will be allocated later in main
+unsigned int num_breakpoints = 0; // this will be incremented as we add breakpoints
 int break_idx; // set and used in callbacks as message passing interface. NOT THREAD SAFE!!!
 
 ////////////////////
@@ -215,6 +216,24 @@ event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event)
 	return VMI_SUCCESS;
 }
 
+
+///////////////////////
+// Breakpoint Helper // 
+///////////////////////
+
+// helper function for creating new breakpoint
+// sym:  symbol to search for
+// off:  offset from symbol to set addr to
+// byt:  byte to be overwritten by interrupt (set to 0 for auto-detect)
+// call: callback function to call when the breakpoint executes
+void add_breakpoint(char* sym, uint16_t off, uint8_t byt, event_response_t (*call)(vmi_instance_t, vmi_event_t*)) {
+	breakpoints[num_breakpoints].symbol = sym;
+	breakpoints[num_breakpoints].offset = off;
+	breakpoints[num_breakpoints].inst_byte = byt;
+	breakpoints[num_breakpoints].callback = call;
+	num_breakpoints++; // increment the number of breakpoints we now have
+}
+
 //////////
 // Main // 
 //////////
@@ -226,32 +245,23 @@ int main (int argc, char **argv)
 	int ret_val = 0; // return code for after goto
 	struct sigaction signal_action;
 
+	char*			*sym;
+  uint16_t	*off;
+  addr_t		*add;
+  uint8_t		*byt;
+
 	// this is the VM or file that we are looking at
 	if (argc != 2) {
 		printf("Usage: %s <vmname>\n", argv[0]);
 		return 1;
 	}
 
-	char*			*sym;
-  uint16_t	*off;
-  addr_t		*add;
-  uint8_t		*byt;
-
 	char *name = argv[1];
 
 	// Set up breakpoints
-	num_breakpoints = 2; // set the number of breakpoints you plan to use | TODO: make this dynamic
-	breakpoints = (breakpoint_t*)calloc(num_breakpoints, sizeof(breakpoint_t)); // allocate space for each breakpoint, zero memory
-	// breakpoint 0 -- break after call to extract_buf, fill rng buffer with fixed values
-	breakpoints[0].symbol = "extract_entropy"; // the function we're breaking on
-	breakpoints[0].offset = 140; // decimal, not hex | found from static analysis of random.o
-	breakpoints[0].inst_byte = 0x41; // statically found, the byte we're overwriting with the breakpoint
-	breakpoints[0].callback = overwrite_buf;
-	// breakpoint 1 -- break before call to extract_buf, store location of rng buffer for later use
-	breakpoints[1].symbol = "extract_entropy";
-	breakpoints[1].offset = 135;
-	breakpoints[1].inst_byte = 0xe8;
-	breakpoints[1].callback = find_buf;
+	breakpoints = (breakpoint_t*)calloc(MAX_BREAKPOINTS, sizeof(breakpoint_t)); // allocate space for each breakpoint, zero memory
+	add_breakpoint("extract_entropy", 140, 0x41, overwrite_buf);
+	add_breakpoint("extract_entropy", 135, 0xe8, find_buf);
 
 	////////////////////
 	// Initialization // 
