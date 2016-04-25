@@ -35,9 +35,9 @@
 #include <libvmi/libvmi.h>
 #include <libvmi/events.h>
 
-#define FUNC_NAME "extract_entropy"
 #define EXTRACT_SIZE 10
 #define RNG_VALUE "ffffffffffffffffffffffffffffffffffff" // "f" is 0x66 in ascii
+#define INT3_INST (0xCC)
 
 vmi_event_t rng_event;
 vmi_event_t rng_ss_event;
@@ -46,70 +46,142 @@ static int interrupted = 0; // set to non-zero when an interrupt happens so we c
 static void close_handler(int signal) {
 	interrupted = signal; // set interrupted to non-zero interrupt signal
 }
-static uint8_t cmp_replace_byte = 0x41; // not a pointer, static value
-static uint8_t int3_inst = 0xcc; // not a pointer, static value
-static unsigned int offset = 140; // offset into func
 
 addr_t func = 0;
 addr_t cmp = 0;
 
-///////////////
-// Callbacks // 
-///////////////
 
-event_response_t rng_single_step_callback(vmi_instance_t vmi, vmi_event_t *event) {
-	printf("Got a single-step callback!\n");
+typedef struct Breakpoints {
+	char* symbol;				// symbol from symbol table to lookup
+	uint16_t offset;		// offset from symbol to instruction
+	addr_t addr;				// resulting address from symbol location + offset
+	uint8_t inst_byte;	// the byte stored at addr (recommend hard code in case of crash, so we can restore)
+	event_response_t (*callback)(vmi_instance_t, vmi_event_t*);		// callback function to invoke after breakpoint is reached
+} breakpoint_t;
 
-	// gameplan step 5
-	printf("Re-adding breakpoint before instruction.\n");
-	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &int3_inst)) {
-		printf("Couldn't write to memory... exiting.\n");
-		return VMI_FAILURE;
-	}
+unsigned int num_breakpoints; // this will be assigned later in main
+breakpoint_t* breakpoints; // this will be allocated later in main
+int break_idx; // set and used in callbacks as message passing interface. NOT THREAD SAFE!!!
 
-	vmi_clear_event(vmi, event, NULL);	
+////////////////////
+// User Callbacks //
+////////////////////
+
+event_response_t find_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called find_buf!\n");
+
+	// read registers
+	printf("Reading RDI register (*r):      0x%llx\n", event->regs.x86->rdi);
+	printf("Reading RSI register (*tmp):    0x%llx\n", event->regs.x86->rsi);
+	printf("Reading RSP+0x16:               0x%llx  (should be the same as RSI)\n", event->regs.x86->rsp+0x16);
 	return VMI_SUCCESS;
 }
 
-event_response_t rng_event_callback(vmi_instance_t vmi, vmi_event_t* event) {
-	printf("Got a callback!\n");
-
+event_response_t overwrite_buf(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Called overwrite_buf!\n");
 	// local vars
 	addr_t val_addr = 0;
-	char buf[64]; // temporary buffer for local values
-	
-	if (event->type != VMI_EVENT_INTERRUPT) {
-		printf("Wanted an interrupt event but got something else...\n");
-		return VMI_FAILURE;
-	}
-	printf("Interrupt event!\n");
+	uint8_t buf[EXTRACT_SIZE];
+
 	// Print everything out
-	printf("VCPU: %d\n", event->vcpu_id);
-	printf("Pagetable id: %d\n", event->vmm_pagetable_id);
-	printf("Instruction pointer: 0x%x\n", event->interrupt_event.gla);
-	printf("Physical page of instruction: 0x%x\n", event->interrupt_event.gfn);
-	printf("Page offset: 0x%x\n", event->interrupt_event.offset);
-	printf("Interrupt type (1 is INT3): %d\n", event->interrupt_event.intr);
-	printf("Current reinject state (1 to deliver to guest, 0 to silence): %d\n", event->interrupt_event.reinject);
-	if (event->interrupt_event.reinject == -1) { // if we need to set this
-		printf("Setting reinject state to 0\n");
-		event->interrupt_event.reinject = 0; // set it to silent
-	}
-	printf("Updated reinject state: %d\n", event->interrupt_event.reinject);
+	//printf("VCPU: %d\n", event->vcpu_id);
+	//printf("Pagetable id: %d\n", event->vmm_pagetable_id);
+	//printf("Instruction pointer: 0x%x\n", event->interrupt_event.gla);
+	//printf("Physical page of instruction: 0x%x\n", event->interrupt_event.gfn);
+	//printf("Page offset: 0x%x\n", event->interrupt_event.offset);
+	//printf("Interrupt type (1 is INT3): %d\n", event->interrupt_event.intr);
 
 	//////////////////////////
 	// Access random number // 
 	//////////////////////////
 	
 	// Print amd64 function args --> see below link for reference
-	// https://blogs.oracle.com/eschrock/entry/debugging_://blogs.oracle.com/eschrock/entry/debugging_on_amd64_part_twoon_amd64_part_tworintf("Reading R9 register: 0x%llx\n\n", register_value);
+	// https://blogs.oracle.com/eschrock/entry/debugging_://blogs.oracle.com/eschrock/entry/debugging_on_amd64_part_twoon_amd64_part_tworintf("Reading R9 register: 0x%llx\n\n", register_value);	
 	
-	printf("Reading RDI register (*r):   0x%llx\n", event->regs.x86->rdi);
-	printf("Reading RSP+0x16:            0x%llx  (should be the same as RSI used to be)\n", event->regs.x86->rsp+0x16);
+	printf("Reading RDI register (*r):      0x%llx\n", event->regs.x86->rdi);
+	printf("Reading RSI register (*tmp):    0x%llx\n", event->regs.x86->rsi);
+	printf("Reading RSP+0x16:               0x%llx  (should be the same as RSI)\n", event->regs.x86->rsp+0x16);
+
+	// val_addr is our RSP+0x16
+	val_addr = event->regs.x86->rsp + 0x16;
+
+	// what's currently at RSP+0x16?
+	vmi_read_va(vmi, val_addr, 0, buf, EXTRACT_SIZE);
+	printf("old buf: ");
+	for (int i = 0; i < EXTRACT_SIZE; i++) {
+		printf("%02x ",buf[i]);
+	}
+	printf("\n");
 
 	// modify rng buffer! (should be at RSP+0x16, from static code analysis)
-	val_addr = event->regs.x86->rsp + 0x16;
 	vmi_write_va(vmi, val_addr, 0, RNG_VALUE, EXTRACT_SIZE);
+
+	// what's at RSP+0x16 now?
+	vmi_read_va(vmi, val_addr, 0, buf, EXTRACT_SIZE);
+	printf("new buf: ");
+	for (int i = 0; i < EXTRACT_SIZE; i++) {
+		printf("%02x ",buf[i]);
+	}
+	printf("\n");
+
+	return VMI_SUCCESS;
+}
+
+//////////////////////
+// LibVMI Callbacks // 
+//////////////////////
+
+event_response_t rng_single_step_callback(vmi_instance_t vmi, vmi_event_t *event) {
+	printf("Got a single-step callback!\n");
+
+	// gameplan step 5
+	printf("Re-adding breakpoint before instruction.\n");
+	uint8_t int3 = INT3_INST; // create temporary variable because we can't use an address to a static #defined int
+	if (VMI_SUCCESS != vmi_write_8_va(vmi, breakpoints[break_idx].addr, 0, &int3)) {
+		printf("Couldn't write to memory... exiting.\n");
+		return VMI_FAILURE;
+	}
+
+	// clear break_idx now that we've reinserted the interrupt
+	break_idx = -1;
+
+	vmi_clear_event(vmi, event, NULL);	
+	return VMI_SUCCESS;
+}
+
+event_response_t rng_int3_event_callback(vmi_instance_t vmi, vmi_event_t* event) {
+
+	break_idx = -1;
+
+	printf("Got an interrupt callback!\n");
+
+	// clear reinject
+	//printf("Current reinject state (1 to deliver to guest, 0 to silence): %d\n", event->interrupt_event.reinject);
+	if (event->interrupt_event.reinject == -1) { // if we need to set this
+		//printf("Setting reinject state to 0\n");
+		event->interrupt_event.reinject = 0; // set it to silent
+		//printf("Updated reinject state: %d\n", event->interrupt_event.reinject);
+	}
+
+	// iterate over breakpoints until we find the one we're at
+	printf("Looking for the breakpoint for address 0x%llx\n", event->interrupt_event.gla);
+	for (int i = 0; i < num_breakpoints; i++) { 
+		if (event->interrupt_event.gla == breakpoints[i].addr) { // if we've found the correct breakpoint
+			break_idx = i;
+			printf("Found it: %d!\n", i);
+			break;
+		}
+	}
+	if (break_idx == -1) {
+		printf("Can't find breakpoint for this instruction: 0x%llx\n",event->interrupt_event.gla);
+		return VMI_FAILURE;
+	}
+
+	// call the appropriate callback
+	if (VMI_SUCCESS != breakpoints[break_idx].callback(vmi, event)) {
+		printf("Callback failed.\n");
+		return VMI_FAILURE;
+	}
 
 	// see "Main gameplan" comment section below for context
 	//	3) at the end of the callback, fix the memory to its original instruction,
@@ -118,7 +190,7 @@ event_response_t rng_event_callback(vmi_instance_t vmi, vmi_event_t* event) {
 
 	// gameplan step 3
 	printf("Removing breakpoint before instruction.\n");
-	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &cmp_replace_byte)) {
+	if (VMI_SUCCESS != vmi_write_8_va(vmi, breakpoints[break_idx].addr, 0, &(breakpoints[break_idx].inst_byte))) {
 		printf("Couldn't write to memory... exiting.\n");
 		return VMI_FAILURE;
 	}
@@ -151,9 +223,7 @@ int main (int argc, char **argv)
 {
 	// local variables
 	vmi_instance_t vmi;
-	status_t status = VMI_SUCCESS;
 	int ret_val = 0; // return code for after goto
-	uint8_t* cmp_inst  = NULL; // temp buffer for value of instruction byte
 	struct sigaction signal_action;
 
 	// this is the VM or file that we are looking at
@@ -162,7 +232,26 @@ int main (int argc, char **argv)
 		return 1;
 	}
 
+	char*			*sym;
+  uint16_t	*off;
+  addr_t		*add;
+  uint8_t		*byt;
+
 	char *name = argv[1];
+
+	// Set up breakpoints
+	num_breakpoints = 2; // set the number of breakpoints you plan to use | TODO: make this dynamic
+	breakpoints = (breakpoint_t*)calloc(num_breakpoints, sizeof(breakpoint_t)); // allocate space for each breakpoint, zero memory
+	// breakpoint 0 -- break after call to extract_buf, fill rng buffer with fixed values
+	breakpoints[0].symbol = "extract_entropy"; // the function we're breaking on
+	breakpoints[0].offset = 140; // decimal, not hex | found from static analysis of random.o
+	breakpoints[0].inst_byte = 0x41; // statically found, the byte we're overwriting with the breakpoint
+	breakpoints[0].callback = overwrite_buf;
+	// breakpoint 1 -- break before call to extract_buf, store location of rng buffer for later use
+	breakpoints[1].symbol = "extract_entropy";
+	breakpoints[1].offset = 135;
+	breakpoints[1].inst_byte = 0xe8;
+	breakpoints[1].callback = find_buf;
 
 	////////////////////
 	// Initialization // 
@@ -193,24 +282,37 @@ int main (int argc, char **argv)
 		goto error_exit; // don't return directly, do cleanup first
 	}
 
-	////////////////////////////////////////////
-	// Find memory location to put breakpoint //
-	////////////////////////////////////////////
+	for (int i = 0; i < num_breakpoints; i++) { // iterate over breakpoints and find the right addresses for them
 
-	printf("Accessing System Map for %s symbol\n", FUNC_NAME);
-	func = vmi_translate_ksym2v(vmi, FUNC_NAME);
-	printf("%s is at 0x%x\n", FUNC_NAME, func);
+		////////////////////////////////////////////
+		// Find memory location to put breakpoint //
+		////////////////////////////////////////////
 
-	// find address of ret instruction of get_random_bytes
-	// get_random_bytes does an unconditional jump into extract_entropy before invoking ret
-	cmp = func+offset; // offset bytes from manual inspection of random.o in gdb
+		// assign short names (note: modifying these modifies the breakpoint struct)
+		sym = &breakpoints[i].symbol;
+		off = &breakpoints[i].offset;
+		add = &breakpoints[i].addr;
+		byt = &breakpoints[i].inst_byte; // remember that if this is not set above, it should be zeroed from calloc
 
-	// DEBUG: this should print "41", the first byte for the 'cmp' instruction we're interested in
-	// confirm offset from extract_entropy to ret function
-	cmp_inst = malloc(1);  // let's allocate a byte for this
+		// find address to break on
+		printf("Accessing System Map for %s symbol\n", *sym);
+		*add = vmi_translate_ksym2v(vmi, *sym) + *off;
+		printf("%s + %u is at 0x%llx\n", *sym, *off, *add);
 
-	vmi_read_8_va(vmi, cmp, 0, cmp_inst);
-	printf("This should be the first byte of the cmp instruction (0x41): 0x%x\n", *cmp_inst);
+		// either verify the byte there is correct, or record which byte is there for later replacing
+		if (*byt == 0) { // if this byte was not set, we need to get it
+			vmi_read_8_va(vmi, *add, 0, byt); // read it directly into byt
+			printf("Saving byte at address 0x%llx: %x\n", *add, *byt);
+		} else { // if the byte was set, verify that it's currently set to that value
+			uint8_t temp_byte = 0;
+			vmi_read_8_va(vmi, *add, 0, &temp_byte); // read it temporarily
+			printf("Checking byte at address 0x%llx is set to %x: %x\n", *add, *byt, temp_byte);
+			if (*byt != temp_byte) { // uh oh, we have an error
+				ret_val = 8;
+				goto error_exit;
+			}
+		}
+	} // end first for loop after breakpoints are constructed properly
 
 	///////////////////
 	// Main gameplan //
@@ -225,17 +327,30 @@ int main (int argc, char **argv)
 	//               //
 	///////////////////
 
-	// Step 1: modify memory in the VM with an INT3 instruction (0xcc)
-	printf("Setting breakpoint before initial function instruction.\n");
-	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &int3_inst)) {
-		printf("Couldn't write INT3 instruction to memory... exiting.\n");
-		ret_val = 5;
-		goto error_exit;
-	}
+	for (int i = 0; i < num_breakpoints; i++) { // iterate over breakpoints and insert them all
 
-	// debug: check memory is now an INT3 instruction
-	vmi_read_8_va(vmi, cmp, 0, cmp_inst);
-	printf("This should be an INT3 instruction (0xcc): 0x%x\n", *cmp_inst);
+		// assign short names (note: modifying these modifies the breakpoint struct)
+		sym = &breakpoints[i].symbol;
+		off = &breakpoints[i].offset;
+		add = &breakpoints[i].addr;
+		byt = &breakpoints[i].inst_byte;
+
+		// Step 1: modify memory in the VM with an INT3 instruction (0xcc)
+		printf("Setting breakpoint at address 0x%llx.\n", *add);
+		uint8_t int3 = INT3_INST; // create temporary variable because we can't use an address to a static #defined int
+		if (VMI_SUCCESS != vmi_write_8_va(vmi, *add, 0, &int3)) {
+			printf("Couldn't write INT3 instruction to memory... exiting.\n");
+			ret_val = 5;
+			goto error_exit;
+		}
+
+		// debug: check memory is now an INT3 instruction
+		uint8_t temp_byte = 0;
+		vmi_read_8_va(vmi, *add, 0, &temp_byte);
+		printf("This should be an INT3 instruction (0xcc): 0x%x\n", temp_byte);
+
+
+	} // end second for loop after breakpoints are all inserted and callback is registered
 
 	// Step 2: register an event on receiving INT3 signal
 	printf("Creating event for callback when breakpoint is reached.\n");
@@ -243,7 +358,7 @@ int main (int argc, char **argv)
 	rng_event.type = VMI_EVENT_INTERRUPT; // interrupt event -- trigger when interrupt occurs
 	rng_event.interrupt_event.intr = INT3; // trigger on INT3 instruction
 	rng_event.interrupt_event.reinject = 0; // swallow interrupt silently without passing it on to guest
-	rng_event.callback = rng_event_callback; // reference to our callback function
+	rng_event.callback = rng_int3_event_callback; // reference to our callback function
 	printf("Registering event...\n");
 	if (VMI_SUCCESS == vmi_register_event(vmi, &rng_event)) {; // register the event!
 		printf("Event Registered!\n");
@@ -272,8 +387,7 @@ int main (int argc, char **argv)
 
 	while(!interrupted) { // until an interrupt happens
 		printf("Waiting for events...\n");
-		status = vmi_events_listen(vmi, 500); // listen for events for 500ms (no event = VMI_SUCCESS)
-		if (status != VMI_SUCCESS) {
+		if (VMI_SUCCESS != vmi_events_listen(vmi, 500)) { // listen for events for 500ms (no event = VMI_SUCCESS)
 			printf("Error waiting for events... exiting.\n");
 			interrupted = -1;
 		}
@@ -285,19 +399,21 @@ int main (int argc, char **argv)
 	//////////////////
 
 error_exit:
-	// attempt to remove breakpoint
-	printf("Removing breakpoint before instruction.\n");
-	if (VMI_SUCCESS != vmi_write_8_va(vmi, cmp, 0, &cmp_replace_byte)) {
-		printf("Couldn't write to memory... exiting.\n");
-		ret_val = 7;
+	// attempt to remove breakpoints
+	for (int i = 0; i < num_breakpoints; i++) { // iterate over breakpoints and insert them all
+
+		// assign short names (note: modifying these modifies the breakpoint struct)
+		sym = &breakpoints[i].symbol;
+		off = &breakpoints[i].offset;
+		add = &breakpoints[i].addr;
+		byt = &breakpoints[i].inst_byte;
+
+		printf("Removing breakpoint %d at 0x%llx.\n", i, *add);
+		if (VMI_SUCCESS != vmi_write_8_va(vmi, *add, 0, byt)) {
+			printf("Couldn't write to memory... exiting.\n");
+			ret_val = 7;
+		}
 	}
-
-	// debug: check memory is now a push instruction
-	vmi_read_8_va(vmi, cmp, 0, cmp_inst);
-	printf("This should be the restored cmp instruction byte (0x41): 0x%x\n", *cmp_inst);
-
-	// free some malloc'd variables (if not allocated, should be NULL)
-	free(cmp_inst);
 
 	// resume the vm
 	printf("Resuming the VM\n");
