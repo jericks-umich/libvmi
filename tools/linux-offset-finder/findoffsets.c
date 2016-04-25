@@ -28,6 +28,10 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/sched.h>
+#include <linux/mm_types.h>
+#include <linux/fs.h>
+#include <linux/path.h>
+#include <linux/dcache.h>
 
 #define MYMODNAME "FindOffsets "
 
@@ -41,15 +45,29 @@ my_init_module(
     void)
 {
     struct task_struct *p = NULL;
+		struct mm_struct *mm = NULL;
+		struct vm_area_struct *va = NULL;
+		struct file *f = NULL;
+		struct path *pa = NULL;
+		struct dentry *d = NULL;
+		// original task_struct offsets
     unsigned long commOffset;
     unsigned long tasksOffset;
     unsigned long mmOffset;
     unsigned long pidOffset;
     unsigned long pgdOffset;
     unsigned long addrOffset;
+		// new offsets for walking the memory map
+		unsigned long mmapOffset;
+		unsigned long vaNextOffset;
+		unsigned long vaStartOffset;
+		unsigned long vaFileOffset;
+		unsigned long pathOffset;
+		unsigned long dentryOffset;
+		unsigned long inameOffset;
 
     printk(KERN_ALERT "Module %s loaded.\n\n", MYMODNAME);
-    p = current;
+    p = current; // load whatever task_stuct is currently running, we don't care which
 
     if (p != NULL) {
         commOffset = (unsigned long) (&(p->comm)) - (unsigned long) (p);
@@ -76,6 +94,31 @@ my_init_module(
                (unsigned int) pidOffset);
         printk(KERN_ALERT "    linux_pgd = 0x%x;\n",
                (unsigned int) pgdOffset);
+
+				mm = p->mm; // find offsets in mm (mm_struct)
+				mmapOffset = (unsigned long) (&(mm->mmap)) - (unsigned long) (mm);
+        printk(KERN_ALERT "    linux_mmap = 0x%x;\n", (unsigned int) mmapOffset);
+
+				va = mm->mmap; // find offsets in va (vm_area_struct)
+				vaNextOffset = (unsigned long) (&(va->vm_next)) - (unsigned long) (va);
+				vaStartOffset = (unsigned long) (&(va->vm_start)) - (unsigned long) (va);
+				vaFileOffset = (unsigned long) (&(va->vm_file)) - (unsigned long) (va);
+        printk(KERN_ALERT "    linux_vm_next = 0x%x;\n", (unsigned int) vaNextOffset);
+        printk(KERN_ALERT "    linux_vm_start = 0x%x;\n", (unsigned int) vaStartOffset);
+        printk(KERN_ALERT "    linux_vm_file = 0x%x;\n", (unsigned int) vaFileOffset);
+
+				f = va->vm_file; // find offsets in f (file struct)
+				pathOffset = (unsigned long) (&(f->f_path)) - (unsigned long) (f);
+        printk(KERN_ALERT "    linux_f_path = 0x%x;\n", (unsigned int) pathOffset);
+
+				pa = &(f->f_path); // find offsets in pa (path struct)
+				dentryOffset = (unsigned long) (&(pa->dentry)) - (unsigned long) (pa);
+        printk(KERN_ALERT "    linux_dentry = 0x%x;\n", (unsigned int) dentryOffset);
+
+				d = pa->dentry; // find offsets in d (dentry struct)
+				inameOffset = (unsigned long) (&(d->d_iname)) - (unsigned long) (d);
+        printk(KERN_ALERT "    linux_d_iname = 0x%x;\n", (unsigned int) inameOffset);
+
         printk(KERN_ALERT "}\n");
     }
     else {
